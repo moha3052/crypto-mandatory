@@ -1,107 +1,160 @@
-﻿import getpass
-import hashlib  # Standardbibliotekets PBKDF2 afleder nøglemateriale fra passwordet.
-import socket  # Opretter TCP-forbindelsen til serveren.
-import threading  # Modtagelse skal kunne fortsætte, mens input() venter.
+﻿
+import hashlib
+import getpass
+import socket
+import threading
 
-# Importen deler TCP-hjælpere; den starter ikke serveren.
-from server import HOST, PORT, MAX_MESSAGE_SIZE, receive_message, send_message
+# Vi genbruger serverens TCP-funktioner
+from server import (
+    HOST,
+    PORT,
+    MAX_MESSAGE_SIZE,
+    send_message,
+    receive_message
+)
 
-# Offentligt, fælles salt: begge klienter skal aflede præcis samme nøgle.
+# Samme salt skal bruges hos begge klienter
 SALT = b"mandatory-one-demo-salt"
-# Gentagne beregninger gør passwordgæt dyrere; tallet følger opgavekravet.
-KDF_ITERATIONS = 100_000
-KEY_LENGTH = 32
+
+# Antal iterationer i PBKDF2
+ITERATIONS = 100000
 
 
 def derive_key(password):
-    """Begge klienter bruger samme offentlige salt og parametre."""
-    if not password:
-        raise ValueError("Password må ikke være tomt.")
+    # PBKDF2 afleder en nøgle fra passwordet
     return hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), SALT, KDF_ITERATIONS, dklen=KEY_LENGTH
+        "sha256",
+        password.encode(),
+        SALT,
+        ITERATIONS,
+        dklen=32
     )
 
 
 def xor_bytes(data, key):
-    # ^ kombinerer bits. Modulo gentager nøglens bytes ved lange beskeder.
-    # (message XOR key) XOR key = message. Genbrug af nøglen er USIKKERT.
-    return bytes(value ^ key[index % len(key)] for index, value in enumerate(data))
+    # XOR sammenligner bits fra data og nøgle.
+    # Modulo gentager nøglen, når den slipper op.
+    # Dette er kun en USIKKER undervisningsdemo.
+    result = []
+
+    for i in range(len(data)):
+        encrypted_byte = data[i] ^ key[i % len(key)]
+        result.append(encrypted_byte)
+
+    return bytes(result)
 
 
 def encrypt_message(message, key):
-    """Omdan tekst til UTF-8-bytes, og XOR-krypter dem før afsendelse."""
-    return xor_bytes(message.encode("utf-8"), key)
+    # Konverter tekst til bytes
+    message_bytes = message.encode("utf-8")
+
+    # XOR laver ciphertext
+    return xor_bytes(message_bytes, key)
 
 
 def decrypt_message(ciphertext, key):
-    """Samme nøgle ophæver XOR; decode omdanner UTF-8-bytes til tekst."""
-    return xor_bytes(ciphertext, key).decode("utf-8")
+    # Samme XOR-operation genskaber bytes
+    decrypted_bytes = xor_bytes(ciphertext, key)
+
+    # Konverter bytes tilbage til tekst
+    return decrypted_bytes.decode("utf-8")
 
 
-def receive_messages(connection, key, disconnected):
-    try:
-        while True:
+def receive_messages(connection, key):
+    # Modtag beskeder fra serveren
+    while True:
+        try:
             ciphertext = receive_message(connection)
+
             if ciphertext is None:
+                print("\nServeren er afbrudt")
                 break
-            try:
-                message = decrypt_message(ciphertext, key)
-            except UnicodeDecodeError:
-                print("\nKan ikke læse beskeden: forkert password eller ændrede data.")
-                continue
+
+            # Dekrypter den modtagne besked
+            message = decrypt_message(ciphertext, key)
+
             print(f"\n{message}\nBesked: ", end="", flush=True)
-    except (OSError, ValueError) as error:
-        if not disconnected.is_set():
-            print(f"\nForbindelsesfejl: {error}")
-    finally:
-        if not disconnected.is_set():
-            print("\nForbindelsen er lukket. Tryk Enter for at afslutte.", flush=True)
-        disconnected.set()
+
+        except UnicodeDecodeError:
+            # Forkert nøgle kan give ugyldig UTF-8.
+            # Men gyldig UTF-8 beviser ikke korrekt nøgle.
+            print("\nBeskeden kunne ikke læses")
+
+        except (OSError, ValueError):
+            print("\nForbindelsen er lukket")
+            break
 
 
 def main():
-    username = input("Brugernavn: ").strip()
-    if not username:
-        raise ValueError("Brugernavn må ikke være tomt.")
-    key = derive_key(getpass.getpass("Fælles password: "))
-    # TCP forbinder til den faste adresse; passwordet bliver lokalt i klienten.
-    with socket.create_connection((HOST, PORT)) as connection:
-        print("Forbundet. Undervisningsdemo med usikker XOR. Skriv /quit for at afslutte.")
-        disconnected = threading.Event()
-        # Modtagetråden viser beskeder, mens hovedtråden venter på input().
-        receiver = threading.Thread(
-            target=receive_messages, args=(connection, key, disconnected), daemon=True
+    username = input("Brugernavn: ")
+
+    # Passwordet vises ikke i terminalen
+    password = getpass.getpass("Fælles password: ")
+
+    if not username or not password:
+        print("Brugernavn og password må ikke være tomme")
+        return
+
+    # Afled en nøgle ved hjælp af PBKDF2
+    key = derive_key(password)
+
+    # Opret TCP-forbindelsen
+    with socket.socket(
+        socket.AF_INET, socket.SOCK_STREAM
+    ) as client:
+
+        client.connect((HOST, PORT))
+
+        print("Forbundet til serveren!")
+        print("Skriv /quit for at afslutte.")
+        print("OBS: XOR er kun en usikker undervisningsdemo.")
+
+        # Modtag beskeder i en separat tråd
+        thread = threading.Thread(
+            target=receive_messages,
+            args=(client, key),
+            daemon=True
         )
-        receiver.start()
+
+        thread.start()
+
+        while True:
+            message = input("Besked: ")
+
+            if message == "/quit":
+                break
+
+            if not message:
+                continue
+
+            # Tilføj brugerens navn
+            full_message = f"{username}: {message}"
+
+            # Krypter inden afsendelse
+            ciphertext = encrypt_message(
+                full_message, key
+            )
+
+            if len(ciphertext) > MAX_MESSAGE_SIZE:
+                print("Beskeden er for lang")
+                continue
+
+            # Send kun ciphertext
+            send_message(client, ciphertext)
+
+        # Luk forbindelsen, når brugeren afslutter
         try:
-            while not disconnected.is_set():
-                message = input("Besked: ")
-                if message == "/quit" or disconnected.is_set():
-                    break
-                if not message:
-                    continue
-                ciphertext = encrypt_message(f"{username}: {message}", key)
-                if len(ciphertext) > MAX_MESSAGE_SIZE:
-                    print("Beskeden er for lang (maks. 65536 bytes inklusive navn).")
-                    continue
-                # Også brugernavnet krypteres. Password og nøgle sendes aldrig.
-                send_message(connection, ciphertext)
-        finally:
-            disconnected.set()
-            # shutdown vækker modtagetrådens recv(), så join() kan afslutte.
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            receiver.join()
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
     try:
         main()
     except ConnectionRefusedError:
-        print("Forbindelsen blev afvist. Start server.py først.")
+        print("Start server.py først")
     except (KeyboardInterrupt, EOFError):
-        print("\nKlienten er afsluttet.")
-    except (OSError, ValueError) as error:
-        print(f"Fejl: {error}")
+        print("\nKlienten er afsluttet")
+    except OSError as error:
+        print(f"Forbindelsesfejl: {error}")
